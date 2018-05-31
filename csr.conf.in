@@ -1,0 +1,11 @@
+[req]
+distinguished_name = dn
+prompt = no
+
+[dn]
+countryName = %(country)s
+stateOrProvinceName = %(state_or_province)s
+localityName = %(locality)s
+organizationName = %(organization)s
+organizationalUnitName = %(organizational_unit)s
+commonName = %(organization)s %(suffix)s%(email_address)s

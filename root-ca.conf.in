@@ -1,0 +1,124 @@
+[ca]
+default_ca = <required-on-command-line>
+
+
+[policy-liberal]
+countryName = optional
+stateOrProvinceName = optional
+localityName = optional
+organizationName = optional
+organizationalUnitName = optional
+commonName = supplied
+emailAddress = optional
+
+
+[x509-root]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+basicConstraints = critical,CA:true,pathlen:2
+keyUsage = critical,keyCertSign,cRLSign
+crlDistributionPoints = @crl-info
+
+
+[x509-cross]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+basicConstraints = critical,CA:true,pathlen:1
+keyUsage = critical,keyCertSign,cRLSign
+crlDistributionPoints = @crl-info
+
+
+[x509-intermediate]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+basicConstraints = critical,CA:true,pathlen:0
+keyUsage = critical,cRLSign,digitalSignature,keyAgreement,keyCertSign
+crlDistributionPoints = @crl-info
+
+
+[root-a]
+new_certs_dir = .
+certificate = root-a.crt
+private_key = root-a.key
+database = root-a.db
+serial = root-a.crt.srl
+crlnumber = root-a.crl.srl
+
+unique_subject = no
+policy = policy-liberal
+email_in_dn = no
+
+copy_extensions = copy
+x509_extensions = <required-on-command-line>
+
+default_md = sha512
+
+cert_opt = ca_default
+name_opt = ca_default
+
+
+[root-b]
+new_certs_dir = .
+certificate = root-b.crt
+private_key = root-b.key
+database = root-b.db
+serial = root-b.crt.srl
+crlnumber = root-b.crl.srl
+
+unique_subject = no
+policy = policy-liberal
+email_in_dn = no
+
+copy_extensions = copy
+x509_extensions = <required-on-command-line>
+
+default_md = sha512
+
+cert_opt = ca_default
+name_opt = ca_default
+
+
+[cross-a]
+new_certs_dir = .
+certificate = cross-a.crt
+private_key = root-a.key
+database = root-a.db
+serial = root-a.crt.srl
+crlnumber = root-a.crl.srl
+
+unique_subject = no
+policy = policy-liberal
+email_in_dn = no
+
+copy_extensions = copy
+x509_extensions = <required-on-command-line>
+
+default_md = sha512
+
+cert_opt = ca_default
+name_opt = ca_default
+
+
+[cross-b]
+new_certs_dir = .
+certificate = cross-b.crt
+private_key = root-b.key
+database = root-b.db
+serial = root-b.crt.srl
+crlnumber = root-b.crl.srl
+
+unique_subject = no
+policy = policy-liberal
+email_in_dn = no
+
+copy_extensions = copy
+x509_extensions = <required-on-command-line>
+
+default_md = sha512
+
+cert_opt = ca_default
+name_opt = ca_default
+
+
+[crl-info]
+URI.0 = %(crl_uri)s

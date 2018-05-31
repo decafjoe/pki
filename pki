@@ -1,0 +1,515 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+A program for managing personal PKI infrastructure.
+
+:author: Joe Joyce <joe@decafjoe.com>
+:copyright: Copyright (c) Joe Joyce, 2018.
+:license: Proprietary
+"""
+from __future__ import print_function
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+try:
+    from configparser import SafeConfigParser
+except ImportError:
+    from ConfigParser import SafeConfigParser
+
+
+# =============================================================================
+# ----- Globals ---------------------------------------------------------------
+# =============================================================================
+
+args = None
+conf = None
+fs = None
+make = None
+parser = None
+
+intermediate_name_re = re.compile('^[a-zA-Z_-]+$')
+leaf_name_re = re.compile('^[a-zA-Z_-]+$')
+
+
+class D(dict):
+    def __getattr__(self, name):
+        return self[name]
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+    def __delattr__(self, name):
+        del self[name]
+
+
+class FS(object):
+    def __init__(self, dry):
+        self.dry = dry
+        self._mtimes = {}
+
+    def exists(self, path):
+        if self.dry and path in self._mtimes:
+            return True
+        return os.path.exists(path)
+
+    def mtime(self, path):
+        if self.dry and path in self._mtimes:
+            return self._mtimes[path]
+        return os.stat(path).st_mtime
+
+    def touch(self, path):
+        if self.dry:
+            self._mtimes[path] = time.time()
+
+
+# =============================================================================
+# ----- Makelike --------------------------------------------------------------
+# =============================================================================
+
+GRAPH = []
+
+
+# ----- Framework -------------------------------------------------------------
+
+def builds(pattern):
+    regex = re.compile(pattern)
+
+    def decorate(fn):
+        fn._target = regex
+        GRAPH.append((regex, fn, [], []))
+        return fn
+
+    return decorate
+
+
+def depends(*patterns, **kwargs):
+    which = 2 if kwargs.get('remake_target_on_change', True) else 3
+
+    def decorate(fn):
+        for item in GRAPH:
+            if item[0] is fn._target:
+                item[which].extend(patterns)
+                break
+        else:
+            raise Exception('could not find target pattern!')
+        return fn
+
+    return decorate
+
+
+class Context(D):
+    def genrsa(self, bits):
+        self.run('openssl', 'genrsa', '-out', self.target, bits)
+
+    def p(self, *args):
+        target = self.get('target', '<unspecified target>')
+        if os.path.isabs(target):
+            target = os.path.split(target)[-1]
+        print('%s: %s' % (target, ' '.join(args)))
+
+
+    def render(self, src, dst, **extra_context):
+        template_context = D(**self)
+        template_context.update(extra_context)
+        with open(src) as in_f:
+            out = in_f.read() % template_context
+            with open(dst, 'w') as out_f:
+                out_f.write(out)
+
+    def resolve(self, section, key):
+        rv = getattr(args, key, None)
+        if not rv:
+            if section:
+                rv = conf[section].get(key, None)
+            if not rv:
+                rv = conf.pki[key]
+        return rv
+
+    def resolve_dict(self, section, *keys):
+        return dict([(key, self.resolve(section, key)) for key in keys])
+
+    def run(self, *args):
+        self.p(*args)
+        if not self.get('dry', True):
+            subprocess.check_call(args)
+
+    @property
+    def sans_target(self):
+        rv = Context(**self)
+        del rv.target
+        return rv
+
+
+class Make(object):
+    def __init__(self, **context):
+        self._context = context
+
+    def __call__(self, target, **context):
+        ctx = Context(**self._context)
+        ctx.update(context)
+        ctx.target = target
+
+        for regex, fn, deps_remake_templates, deps_noremake_templates in GRAPH:
+            match = regex.search(target)
+            if match:
+                break
+        else:
+            ctx.p('no build targets matched, assuming this is not built by us')
+            return
+
+        target_match_dict = match.groupdict()
+        ctx.update(target_match_dict)
+
+        deps = {}
+        for template in deps_remake_templates:
+            deps[template % ctx] = True
+        for template in deps_noremake_templates:
+            deps[template % ctx] = False
+
+        needs_make = not fs.exists(target)
+        if needs_make:
+            ctx.p('does not exist, will need to build it')
+
+        n = len(deps)
+        s = 'dependency' if n == 1 else 'dependencies'
+        ctx.p('building/checking %i %s' % (n, s))
+
+        target_mtime = 0 if needs_make else fs.mtime(target)
+        for dep, remake in deps.items():
+            def p(msg):
+                filename = dep
+                if os.path.isabs(filename):
+                    filename = os.path.split(dep)[-1]
+                ctx.p('%s:' % filename, msg)
+
+            make(dep, **ctx.sans_target)
+            if not needs_make:
+                if fs.mtime(dep) > target_mtime:
+                    if remake:
+                        msg = 'forces target rebuild'
+                        needs_make = True
+                    else:
+                        msg = 'but does not force target rebuild'
+                    p('updated more recently than target, %s' % msg)
+                else:
+                    p('exists but is older than target, no target rebuild')
+
+        if needs_make:
+            fn(ctx)
+            fs.touch(target)
+        else:
+            ctx.p('target fully up to date, doing nothing')
+
+
+# ----- Hacks -----------------------------------------------------------------
+#
+# Rules that have to be defined first so other rules don't shadow
+# them.
+#
+
+@depends('cross-a.pem', 'cross-b.pem', 'root-a.pem', 'root-b.pem')
+@builds('roots.pem')
+def roots_pem(ctx):
+    ctx.p('combining root-a, root-b, cross-a, and cross-b pems')
+    if not ctx.dry:
+        with open(ctx.target, 'w') as out_f:
+            for kind in ('root', 'cross'):
+                for which in ('a', 'b'):
+                    with open('%s-%s.pem' % (kind, which)) as in_f:
+                        out_f.write('%s\n' % in_f.read().strip())
+
+
+# ----- Shared ----------------------------------------------------------------
+
+def depends_ca_db(name):
+    extensions = ('crl.srl', 'crt.srl', 'db', 'db.attr')
+    filenames = ['%s.%s' % (name, ext) for ext in extensions]
+    kwargs = dict(remake_target_on_change=False)
+    return depends(*filenames, **kwargs)
+
+
+@builds('\.db(\.attr)?$')
+def empty(ctx):
+    ctx.p('making empty file')
+    if not ctx.dry:
+        with open(ctx.target, 'w') as f:
+            f.write('')
+
+@builds('\.srl$')
+def initial_serial(ctx):
+    ctx.p('populating with initial serial number 01')
+    if not ctx.dry:
+        with open(ctx.target, 'w') as f:
+            f.write('01\n')
+
+
+@depends('%(name)s.crt')
+@builds('(?P<name>.+)\.pem$')
+def pem(ctx):
+    ctx.run(
+        'openssl', 'x509',
+        '-in', '%s.crt' % ctx.name,
+        '-outform', 'pem',
+        '-out', ctx.target,
+    )
+
+
+# ----- Root ------------------------------------------------------------------
+
+@depends('%(source)s/root-ca.conf.in')
+@builds('root-ca.conf$')
+def ca_conf(ctx):
+    ctx.p('generating ca config file from root-ca.conf.in')
+    if not ctx.dry:
+        ctx.render(
+            '%(source)s/root-ca.conf.in' % ctx,
+            ctx.target,
+            **ctx.resolve_dict(None, 'crl_uri')
+        )
+
+
+@builds('root-(?P<which>[ab]).key$')
+def root_key(ctx):
+    ctx.genrsa(ctx.resolve('root', 'key_length'))
+
+
+@depends('%(source)s/csr.conf.in')
+@builds('(?P<kind>(root|cross))-(?P<which>[ab]).csr.conf$')
+def root_csr_conf(ctx):
+    ctx.p('generating csr config file from csr.conf.in')
+    if not ctx.dry:
+        ctx.render(
+            '%(source)s/csr.conf.in' % ctx,
+            ctx.target,
+            email_address='',
+            suffix='(%s %s)' % (ctx.kind.upper(), ctx.which.upper()),
+            **ctx.resolve_dict(
+                'root',
+                'country',
+                'locality',
+                'organization',
+                'organizational_unit',
+                'state_or_province',
+            )
+        )
+
+
+@depends('%(kind)s-%(which)s.csr.conf', 'root-%(which)s.key')
+@builds('(?P<kind>(root|cross))-(?P<which>[ab]).csr$')
+def root_csr(ctx):
+    ctx.run(
+        'openssl', 'req',
+        '-new',
+        '-config', '%s-%s.csr.conf' % (ctx.kind, ctx.which),
+        '-key', 'root-%s.key' % ctx.which,
+        '-out', ctx.target,
+    )
+
+
+@depends_ca_db('root-%(which)s')
+@depends('root-ca.conf', 'root-%(which)s.csr')
+@builds('root-(?P<which>[ab]).crt$')
+def root_self_crt(ctx):
+    ctx.run(
+        'openssl', 'ca',
+        '-batch',
+        '-selfsign',
+        '-config', 'root-ca.conf',
+        '-name', 'root-%s' % ctx.which,
+        '-extensions', 'x509-root',
+        '-days', ctx.resolve('root', 'days'),
+        '-in', 'root-%s.csr' % ctx.which,
+        '-out', ctx.target,
+    )
+
+
+@depends('cross-%(which)s.csr', 'root-a.crt', 'root-b.crt')
+@builds('cross-(?P<which>[ab]).crt$')
+def root_cross_crt(ctx):
+    ctx.run(
+        'openssl', 'ca',
+        '-batch',
+        '-config', 'root-ca.conf',
+        '-name', 'root-%s' % ('b' if ctx.which == 'a' else 'a'),
+        '-extensions', 'x509-cross',
+        '-days', ctx.resolve('root', 'days'),
+        '-in', 'cross-%s.csr' % ctx.which,
+        '-out', ctx.target,
+    )
+
+
+@depends('cross-a.crt', 'cross-b.crt', 'root-a.crt', 'root-b.crt')
+@builds('roots.crt$')
+def root_combined(ctx):
+    ctx.p('combining root-a, root-b, cross-a, and cross-b into master cert')
+    if not ctx.dry:
+        with open(ctx.target, 'w') as out_f:
+            for kind in ('root', 'cross'):
+                for which in ('a', 'b'):
+                    with open('%s-%s.crt' % (kind, which)) as in_f:
+                        out_f.write('%s\n' % in_f.read().strip())
+
+
+# =============================================================================
+# ----- Commands --------------------------------------------------------------
+# =============================================================================
+
+commands = []
+
+
+def command(fn):
+    commands.append(fn)
+    return fn
+
+
+@command
+def root():
+    """Generate the cross-signed PKI roots."""
+    parser.add_argument(
+        '--days',
+        default=0,
+        help='number of days root ca is valid (default: from config)',
+        metavar='INT',
+        type=int,
+    )
+    parser.add_argument(
+        '--key-length',
+        default=0,
+        help='key length for root ca keys (default: from config)',
+        metavar='INT',
+        type=int,
+    )
+    parser.add_argument(
+        '--crl-uri',
+        help='uri for crl distribution point (default: from config)',
+        metavar='URI',
+    )
+    parser.add_argument(
+        '--country',
+        help='country code (default: from config)',
+        metavar='STR',
+    )
+    parser.add_argument(
+        '--state-or-province',
+        help='state or province code (default: from config)',
+        metavar='STR',
+    )
+    parser.add_argument(
+        '--locality',
+        help='locality name (default: from config)',
+        metavar='STR',
+    )
+    parser.add_argument(
+        '--organization',
+        help='organization name (default: from config)',
+        metavar='STR',
+    )
+    parser.add_argument(
+        '--organizational-unit',
+        help='organizational unit name (default: from config)',
+        metavar='STR',
+    )
+
+    yield
+
+    make('roots.pem')
+
+
+def main(argv=None, exit=sys.exit):
+    global args
+    global conf
+    global fs
+    global make
+    global parser
+
+    if argv is None:
+        argv = sys.argv
+
+    root_path = os.path.abspath(os.path.dirname(__file__))
+
+    root_parser = argparse.ArgumentParser(
+        description='A program for managing personal PKI infrastructure.',
+    )
+    root_parser.add_argument(
+        '-c',
+        '--config',
+        default=os.path.join(root_path, 'site.conf'),
+        help='path to the site configuration file (default: %(default)s)',
+        metavar='FILE',
+    )
+    root_parser.add_argument(
+        '-o',
+        '--output',
+        default=os.path.join(root_path, 'files'),
+        help='directory in which to generate files (default: %(default)s)',
+        metavar='DIR',
+    )
+    root_parser.add_argument(
+        '-d',
+        '--dry',
+        action='store_true',
+        default=False,
+        help='dry run – do not actually run commands, change files, etc',
+    )
+
+    subparsers = root_parser.add_subparsers(
+        description='Convenience commands for PKI infrastructure.',
+    )
+    for fn in commands:
+        parser = subparsers.add_parser(fn.__name__, help=fn.__doc__)
+        generator = fn()
+        generator.next()
+        parser.set_defaults(_generator=generator)
+
+    args = root_parser.parse_args(argv[1:])
+
+    config_parser = SafeConfigParser()
+    with open(os.path.join(root_path, 'defaults.conf')) as f:
+        config_parser.readfp(f)
+    if os.path.exists(args.config):
+        with open(args.config) as f:
+            config_parser.readfp(f)
+
+    conf = D()
+    key = lambda s: s.replace('-', '_')
+    for section in config_parser.sections():
+        section_key = key(section)
+        conf[section_key] = D()
+        for option in config_parser.options(section):
+            conf[section_key][key(option)] = config_parser.get(section, option)
+
+    fs = FS(args.dry)
+    make = Make(dry=args.dry, source=root_path)
+
+    tmp = None
+    wd = args.output
+    if not os.path.exists(args.output):
+        print('%s: mkdir' % args.output)
+        if args.dry:
+            wd = tmp = tempfile.mkdtemp()
+        else:
+            os.mkdir(args.output)
+
+    os.chdir(wd)
+    try:
+        rv = args._generator.next()
+    except StopIteration:
+        rv = 0
+    finally:
+        if tmp is not None:
+            os.chdir(os.path.sep)
+            shutil.rmtree(tmp)
+
+    exit(rv)
+
+
+if __name__ == '__main__':
+    main()
+

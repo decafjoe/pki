@@ -136,7 +136,14 @@ class Context(D):
             with open(dst, 'w') as out_f:
                 out_f.write(out)
 
-    def render_csr_conf(self, section, cn, email):
+    def render_csr_conf(
+            self,
+            section,
+            cn,
+            email,
+            source='%(source)s/csr.conf.in',
+            **extra
+    ):
         ctx = self.resolve_dict(
             section,
             'country',
@@ -146,7 +153,8 @@ class Context(D):
             'state_or_province',
         )
         ctx.update(dict(common_name=cn, email_address=email))
-        self.render('%(source)s/csr.conf.in' % self, self.target, **ctx)
+        ctx.update(extra)
+        self.render(source % self, self.target, **ctx)
 
     def run(self, *args):
         self.p(*args)
@@ -285,13 +293,13 @@ def pem(ctx):
 
 # ----- Root ------------------------------------------------------------------
 
-@depends('%(source)s/root-ca.conf.in')
-@builds('root-ca.conf$')
+@depends('%(source)s/root.conf.in')
+@builds('root.conf$')
 def ca_conf(ctx):
-    ctx.p('generating ca config file from root-ca.conf.in')
+    ctx.p('generating ca config file from root.conf.in')
     if not ctx.dry:
         ctx.render(
-            '%(source)s/root-ca.conf.in' % ctx,
+            '%(source)s/root.conf.in' % ctx,
             ctx.target,
             **ctx.resolve_dict(None, 'crl_uri')
         )
@@ -319,14 +327,14 @@ def root_csr(ctx):
 
 
 @depends_ca_db('root-%(which)s')
-@depends('root-ca.conf', 'root-%(which)s.csr')
+@depends('root.conf', 'root-%(which)s.csr')
 @builds('root-(?P<which>[ab]).crt$')
 def root_self_crt(ctx):
     ctx.openssl(
         'ca',
         '-batch',
         '-selfsign',
-        '-config', 'root-ca.conf',
+        '-config', 'root.conf',
         '-name', 'root-%s' % ctx.which,
         '-extensions', 'x509-root',
         '-days', ctx.resolve('root', 'days'),
@@ -341,7 +349,7 @@ def root_cross_crt(ctx):
     ctx.openssl(
         'ca',
         '-batch',
-        '-config', 'root-ca.conf',
+        '-config', 'root.conf',
         '-name', 'root-%s' % ('b' if ctx.which == 'a' else 'a'),
         '-extensions', 'x509-cross',
         '-days', ctx.resolve('root', 'days'),
@@ -403,21 +411,71 @@ def intermediate_conf(ctx):
 
 
 @depends_ca_db('intermediate-%(name)s')
-@depends(
-    'root-ca.conf',
-    'intermediate-%(name)s.conf',
-    'intermediate-%(name)s.csr',
-)
+@depends('intermediate-%(name)s.conf', 'intermediate-%(name)s.csr')
 @builds_intermediate('\.crt$')
 def intermediate_crt(ctx):
     ctx.openssl(
         'ca',
         '-batch',
-        '-config', 'root-ca.conf',
+        '-config', 'root.conf',
         '-name', 'cross-%s' % ctx.sign_with,
         '-extensions', 'x509-intermediate',
         '-days', ctx.resolve('intermediate', 'days'),
         '-in', 'intermediate-%s.csr' % ctx.name,
+        '-out', ctx.target,
+        *ctx.ca_args
+    )
+
+
+# ----- Leaf ------------------------------------------------------------------
+
+def builds_leaf(suffix):
+    prefix = 'leaf-'
+    pattern = id_re.pattern[1:-1]
+    return builds('%s(?P<name>%s)%s' % (prefix, pattern, suffix))
+
+
+@builds_leaf('.key$')
+def leaf_key(ctx):
+    ctx.genrsa(ctx.resolve('leaf', 'key_length'))
+
+
+@depends('%(source)s/csr.conf.in')
+@builds_leaf('\.csr\.conf$')
+def leaf_csr_conf(ctx):
+    ctx.p('generating leaf csr config file from csr.conf.in')
+    if not ctx.dry:
+        alt_names = '\n'.join(
+            ['DNS.%i = %s' % (i, name) for i, name in enumerate(args.name, 1)],
+        )
+        email = ''
+        if args.email:
+            email = '\nemailAddress = %s' % args.email
+        ctx.render_csr_conf(
+            'leaf',
+            args.name[0],
+            email,
+            '%(source)s/leaf.conf.in',
+            alt_names=alt_names,
+        )
+
+
+@depends('leaf-%(name)s.csr.conf', 'leaf-%(name)s.key')
+@builds_leaf('\.csr$')
+def leaf_csr(ctx):
+    name = 'leaf-%s' % ctx.name
+    ctx.req(name, name)
+
+
+@depends('leaf-%(name)s.csr')
+@builds_leaf('\.crt$')
+def leaf_crt(ctx):
+    ctx.openssl(
+        'ca',
+        '-batch',
+        '-config', 'intermediate-%s.conf' % ctx.sign_with,
+        '-days', ctx.resolve('leaf', 'days'),
+        '-in', 'leaf-%s.csr' % ctx.name,
         '-out', ctx.target,
         *ctx.ca_args
     )
@@ -439,14 +497,14 @@ def add_req_arguments():
     parser.add_argument(
         '--days',
         default=0,
-        help='number of days ca is valid (default: from config)',
+        help='number of days certificate is valid (default: from config)',
         metavar='INT',
         type=int,
     )
     parser.add_argument(
         '--key-length',
         default=0,
-        help='key length for ca key (default: from config)',
+        help='key length for generated key (default: from config)',
         metavar='INT',
         type=int,
     )
@@ -557,6 +615,127 @@ def intermediate():
                 yield 1
 
     make('intermediate-%s.pem' % id, ca_args=ca_args, sign_with=sign_with)
+
+
+@command
+def leaf():
+    """Generate a certificate signed by an intermediate CA."""
+    pattern = id_re.pattern
+
+    parser.add_argument(
+        'id',
+        help='identifier of the generated certificate (must match %s)' \
+             % pattern,
+        nargs=1,
+    )
+    parser.add_argument(
+        'name',
+        help='name(s) to be included in certificate (the first will be the '
+             'common name)',
+        nargs='+',
+    )
+
+    add_req_arguments()
+
+    parser.add_argument(
+        '-e',
+        '--email',
+        default=None,
+        help='add specified email address to the csr',
+    )
+
+    parser.add_argument(
+        '-k',
+        '--key-usage',
+        default='digitalSignature,keyAgreement,keyEncipherment,nonRepudiation',
+        help='comma-separated list of key usages (default: %(default)s)',
+    )
+    parser.add_argument(
+        '-u',
+        '--extended-key-usage',
+        default='',
+        help='comma-separated list of extended key usages (default: <none>)',
+    )
+
+    usage_group = parser.add_mutually_exclusive_group()
+    usage_group.add_argument(
+        '--vpn-client',
+        action='store_true',
+        default=False,
+        help='generate vpn client certificate (overrides -k and -u)',
+    )
+    usage_group.add_argument(
+        '--vpn-server',
+        action='store_true',
+        default=False,
+        help='generate vpn server certificate (overrides -k and -u)',
+    )
+
+    sign_group = parser.add_mutually_exclusive_group(required=True)
+    sign_group.add_argument(
+        '-y',
+        '--yubikey',
+        action='store_true',
+        default=False,
+        help='use yubikey-based key for signing the leaf certificate',
+    )
+    sign_group.add_argument(
+        '-s',
+        '--sign-with',
+        default=None,
+        help='sign with an on-disk intermediate cert/key as generated with '
+             'the intermediate subcommand (the argument value should be the '
+             'id you specified to the intermediate subcommand)',
+        metavar='CERT_NAME',
+    )
+
+    yield
+
+    id = args.id[0]
+
+    if not id_re.search(id):
+        msg = 'error: id "%s" violates regex "%s"' % (id, pattern)
+        print(msg, file=sys.stderr)
+        yield 1
+
+    if args.yubikey:
+        # TODO(jjoyce): implement this
+        print('error: cannot currently handle yubikeys', file=sys.stderr)
+        yield 1
+    else:
+        ca_args = ()
+        sign_with = args.sign_with
+        conf_path = 'intermediate-%s.conf' % args.sign_with
+        crt_path = 'intermediate-%s.pem' % args.sign_with
+        key_path = 'intermediate-%s.key' % args.sign_with
+        for path in (conf_path, crt_path, key_path):
+            if not os.path.exists(path):
+                msg = 'error: required file is missing: %s' % path
+                print(msg, file=sys.stderr)
+                yield 1
+
+    if args.vpn_server:
+        key_usage = 'digitalSignature,keyAgreement,keyEncipherment,' \
+                    'nonRepudiation'
+        extended_key_usage = 'serverAuth'
+    elif args.vpn_client:
+        key_usage = 'digitalSignature,keyEncipherment,nonRepudiation'
+        extended_key_usage = 'clientAuth'
+    else:
+        key_usage = args.key_usage
+        extended_key_usage = args.extended_key_usage
+
+    if extended_key_usage:
+        fmt = '\nextendedKeyUsage = critical,%s'
+        extended_key_usage = fmt % extended_key_usage
+
+    make(
+        'leaf-%s.pem' % id,
+        ca_args=ca_args,
+        extended_key_usage=extended_key_usage,
+        key_usage=key_usage,
+        sign_with=sign_with,
+    )
 
 
 def main(argv=None, exit=sys.exit):

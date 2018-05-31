@@ -1,4 +1,5 @@
 [req]
+req_extensions = ext
 default_md = sha512
 distinguished_name = dn
 prompt = no
@@ -11,3 +12,12 @@ localityName = %(locality)s
 organizationName = %(organization)s
 organizationalUnitName = %(organizational_unit)s
 commonName = %(common_name)s%(email_address)s
+
+
+[ext]
+keyUsage = critical,%(key_usage)s%(extended_key_usage)s
+subjectAltName = @alt-names
+
+
+[alt-names]
+%(alt_names)s

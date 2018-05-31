@@ -28,14 +28,13 @@ except ImportError:
 # ----- Globals ---------------------------------------------------------------
 # =============================================================================
 
+id_re = re.compile('^[a-zA-Z_-]+$')
+
 args = None
 conf = None
 fs = None
 make = None
 parser = None
-
-intermediate_name_re = re.compile('^[a-zA-Z_-]+$')
-leaf_name_re = re.compile('^[a-zA-Z_-]+$')
 
 
 class D(dict):
@@ -105,23 +104,17 @@ def depends(*patterns, **kwargs):
 
 
 class Context(D):
-    def genrsa(self, bits):
-        self.run('openssl', 'genrsa', '-out', self.target, bits)
+    @property
+    def sans_target(self):
+        rv = Context(**self)
+        del rv.target
+        return rv
 
     def p(self, *args):
         target = self.get('target', '<unspecified target>')
         if os.path.isabs(target):
             target = os.path.split(target)[-1]
         print('%s: %s' % (target, ' '.join(args)))
-
-
-    def render(self, src, dst, **extra_context):
-        template_context = D(**self)
-        template_context.update(extra_context)
-        with open(src) as in_f:
-            out = in_f.read() % template_context
-            with open(dst, 'w') as out_f:
-                out_f.write(out)
 
     def resolve(self, section, key):
         rv = getattr(args, key, None)
@@ -135,16 +128,45 @@ class Context(D):
     def resolve_dict(self, section, *keys):
         return dict([(key, self.resolve(section, key)) for key in keys])
 
+    def render(self, src, dst, **extra_context):
+        template_context = D(**self)
+        template_context.update(extra_context)
+        with open(src) as in_f:
+            out = in_f.read() % template_context
+            with open(dst, 'w') as out_f:
+                out_f.write(out)
+
+    def render_csr_conf(self, section, cn, email):
+        ctx = self.resolve_dict(
+            section,
+            'country',
+            'locality',
+            'organization',
+            'organizational_unit',
+            'state_or_province',
+        )
+        ctx.update(dict(common_name=cn, email_address=email))
+        self.render('%(source)s/csr.conf.in' % self, self.target, **ctx)
+
     def run(self, *args):
         self.p(*args)
         if not self.get('dry', True):
             subprocess.check_call(args)
 
-    @property
-    def sans_target(self):
-        rv = Context(**self)
-        del rv.target
-        return rv
+    def openssl(self, *args):
+        self.run('openssl', *args)
+
+    def genrsa(self, bits):
+        self.openssl('genrsa', '-out', self.target, bits)
+
+    def req(self, name, key_name):
+        self.openssl(
+            'req',
+            '-new',
+            '-config', '%s.csr.conf' % name,
+            '-key', '%s.key' % key_name,
+            '-out', self.target,
+        )
 
 
 class Make(object):
@@ -253,8 +275,8 @@ def initial_serial(ctx):
 @depends('%(name)s.crt')
 @builds('(?P<name>.+)\.pem$')
 def pem(ctx):
-    ctx.run(
-        'openssl', 'x509',
+    ctx.openssl(
+        'x509',
         '-in', '%s.crt' % ctx.name,
         '-outform', 'pem',
         '-out', ctx.target,
@@ -285,40 +307,23 @@ def root_key(ctx):
 def root_csr_conf(ctx):
     ctx.p('generating csr config file from csr.conf.in')
     if not ctx.dry:
-        ctx.render(
-            '%(source)s/csr.conf.in' % ctx,
-            ctx.target,
-            email_address='',
-            suffix='(%s %s)' % (ctx.kind.upper(), ctx.which.upper()),
-            **ctx.resolve_dict(
-                'root',
-                'country',
-                'locality',
-                'organization',
-                'organizational_unit',
-                'state_or_province',
-            )
-        )
+        org = ctx.resolve('root', 'organization')
+        cn = '%s (%s %s)' % (org, ctx.kind.upper(), ctx.which.upper())
+        ctx.render_csr_conf('root', cn, '')
 
 
 @depends('%(kind)s-%(which)s.csr.conf', 'root-%(which)s.key')
 @builds('(?P<kind>(root|cross))-(?P<which>[ab]).csr$')
 def root_csr(ctx):
-    ctx.run(
-        'openssl', 'req',
-        '-new',
-        '-config', '%s-%s.csr.conf' % (ctx.kind, ctx.which),
-        '-key', 'root-%s.key' % ctx.which,
-        '-out', ctx.target,
-    )
+    ctx.req('%s-%s' % (ctx.kind, ctx.which), 'root-%s' % ctx.which)
 
 
 @depends_ca_db('root-%(which)s')
 @depends('root-ca.conf', 'root-%(which)s.csr')
 @builds('root-(?P<which>[ab]).crt$')
 def root_self_crt(ctx):
-    ctx.run(
-        'openssl', 'ca',
+    ctx.openssl(
+        'ca',
         '-batch',
         '-selfsign',
         '-config', 'root-ca.conf',
@@ -333,8 +338,8 @@ def root_self_crt(ctx):
 @depends('cross-%(which)s.csr', 'root-a.crt', 'root-b.crt')
 @builds('cross-(?P<which>[ab]).crt$')
 def root_cross_crt(ctx):
-    ctx.run(
-        'openssl', 'ca',
+    ctx.openssl(
+        'ca',
         '-batch',
         '-config', 'root-ca.conf',
         '-name', 'root-%s' % ('b' if ctx.which == 'a' else 'a'),
@@ -357,6 +362,67 @@ def root_combined(ctx):
                         out_f.write('%s\n' % in_f.read().strip())
 
 
+# ----- Intermediate ----------------------------------------------------------
+
+def builds_intermediate(suffix):
+    prefix = 'intermediate-'
+    pattern = id_re.pattern[1:-1]
+    return builds('%s(?P<name>%s)%s' % (prefix, pattern, suffix))
+
+
+@builds_intermediate('\.key$')
+def intermediate_key(ctx):
+    ctx.genrsa(ctx.resolve('intermediate', 'key_length'))
+
+
+@depends('%(source)s/csr.conf.in')
+@builds_intermediate('\.csr\.conf$')
+def intermediate_csr_conf(ctx):
+    ctx.p('generating csr config file from csr.conf.in')
+    if not ctx.dry:
+        email = ''
+        if args.email:
+            email = '\nemailAddress = %s' % args.email
+        ctx.render_csr_conf('intermediate', args.name[0], email)
+
+
+@depends('intermediate-%(name)s.csr.conf', 'intermediate-%(name)s.key')
+@builds_intermediate('\.csr$')
+def intermediate_csr(ctx):
+    name = 'intermediate-%s' % ctx.name
+    ctx.req(name, name)
+
+
+
+@depends('%(source)s/intermediate.conf.in')
+@builds_intermediate('\.conf$')
+def intermediate_conf(ctx):
+    ctx.p('generating intermediate ca config file from intermediate.conf.in')
+    if not ctx.dry:
+        ctx.render('%(source)s/intermediate.conf.in' % ctx, ctx.target)
+
+
+@depends_ca_db('intermediate-%(name)s')
+@depends(
+    'root-ca.conf',
+    'intermediate-%(name)s.conf',
+    'intermediate-%(name)s.csr',
+)
+@builds_intermediate('\.crt$')
+def intermediate_crt(ctx):
+    ctx.openssl(
+        'ca',
+        '-batch',
+        '-config', 'root-ca.conf',
+        '-name', 'cross-%s' % ctx.sign_with,
+        '-extensions', 'x509-intermediate',
+        '-days', ctx.resolve('intermediate', 'days'),
+        '-in', 'intermediate-%s.csr' % ctx.name,
+        '-out', ctx.target,
+        *ctx.ca_args
+    )
+
+
 # =============================================================================
 # ----- Commands --------------------------------------------------------------
 # =============================================================================
@@ -369,27 +435,20 @@ def command(fn):
     return fn
 
 
-@command
-def root():
-    """Generate the cross-signed PKI roots."""
+def add_req_arguments():
     parser.add_argument(
         '--days',
         default=0,
-        help='number of days root ca is valid (default: from config)',
+        help='number of days ca is valid (default: from config)',
         metavar='INT',
         type=int,
     )
     parser.add_argument(
         '--key-length',
         default=0,
-        help='key length for root ca keys (default: from config)',
+        help='key length for ca key (default: from config)',
         metavar='INT',
         type=int,
-    )
-    parser.add_argument(
-        '--crl-uri',
-        help='uri for crl distribution point (default: from config)',
-        metavar='URI',
     )
     parser.add_argument(
         '--country',
@@ -417,9 +476,87 @@ def root():
         metavar='STR',
     )
 
+
+@command
+def root():
+    """Generate the cross-signed PKI roots."""
+    parser.add_argument(
+        '--crl-uri',
+        help='uri for crl distribution point (default: from config)',
+        metavar='URI',
+    )
+    add_req_arguments()
+
     yield
 
     make('roots.pem')
+
+
+@command
+def intermediate():
+    """Generate the intermediate CA for day-to-day signing."""
+    pattern = id_re.pattern
+
+    parser.add_argument(
+        'id',
+        help='identifier for the certificate (must match %s)' % pattern,
+        nargs=1,
+    )
+    parser.add_argument(
+        'name',
+        help='name for the certificate (must match %s)' % pattern,
+        nargs=1,
+    )
+    parser.add_argument(
+        '--email',
+        help='email address (default: <none>)',
+    )
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '-y',
+        '--yubikey',
+        action='store_true',
+        default=False,
+        help='use yubikey-based root key for signing the intermediate '
+             'certificate',
+    )
+    group.add_argument(
+        '-s',
+        '--sign-with',
+        choices=('a', 'b'),
+        default='a',
+        help='sign with an on-disk root cert/key as generated with the root '
+             'subcommand (choices: %(choices)s) (default: %(default)s)',
+    )
+
+    add_req_arguments()
+
+    yield
+
+    id = args.id[0]
+
+    if not id_re.search(id):
+        msg = 'error: identifier "%s" violates regex "%s"' % (id, pattern)
+        print(msg, file=sys.stderr)
+        yield 1
+
+    if args.yubikey:
+        # TODO(jjoyce): implement this
+        print('error: cannot currently handle yubikeys', file=sys.stderr)
+        yield 1
+    else:
+        ca_args = ()
+        sign_with = args.sign_with
+        crt_path = 'cross-%s.crt' % sign_with
+        key_path = 'root-%s.key' % sign_with
+        for path in (crt_path, key_path):
+            if not os.path.exists(path):
+                msg = 'error: required file is missing: %s' % path
+                print(msg, file=sys.stderr)
+                yield 1
+
+    make('intermediate-%s.pem' % id, ca_args=ca_args, sign_with=sign_with)
 
 
 def main(argv=None, exit=sys.exit):

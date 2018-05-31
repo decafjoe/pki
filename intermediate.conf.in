@@ -1,0 +1,38 @@
+[ca]
+default_ca = intermediate
+
+
+[policy-liberal]
+countryName = optional
+stateOrProvinceName = optional
+localityName = optional
+organizationName = optional
+organizationalUnitName = optional
+commonName = supplied
+emailAddress = optional
+
+
+[x509-leaf]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+basicConstraints = critical,CA:false,pathlen:0
+
+
+[intermediate]
+new_certs_dir = .
+certificate = intermediate-%(name)s.crt
+private_key = intermediate-%(name)s.key
+database = intermediate-%(name)s.db
+serial = intermediate-%(name)s.crt.srl
+
+unique_subject = no
+policy = policy-liberal
+email_in_dn = no
+
+copy_extensions = copy
+x509_extensions = x509-leaf
+
+default_md = sha512
+
+cert_opt = ca_default
+name_opt = ca_default

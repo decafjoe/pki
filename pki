@@ -33,6 +33,7 @@ id_re = re.compile('^[a-zA-Z_-]+$')
 
 args = None
 conf = None
+directory = None
 fs = None
 make = None
 parser = None
@@ -544,11 +545,11 @@ def find_yubikey_certificate():
     stdout, _ = process.communicate()
     if not process.returncode:
         certificate = stdout.strip()
-        filenames = os.listdir(args.directory)
+        filenames = os.listdir(directory)
         filenames = fnmatch.filter(filenames, 'cross-*.pem') \
                     + fnmatch.filter(filenames, 'intermediate-*.pem')
         for filename in filenames:
-            path = os.path.join(args.directory, filename)
+            path = os.path.join(directory, filename)
             with open(path) as f:
                 if f.read().strip() == certificate:
                     return filename
@@ -788,8 +789,8 @@ def ykload():
         crt_filename = 'cross-%s.crt' % args.root
         key_filename = 'root-%s.key' % args.root
 
-    crt_path = os.path.join(args.directory, crt_filename)
-    key_path = os.path.join(args.directory, key_filename)
+    crt_path = os.path.join(directory, crt_filename)
+    key_path = os.path.join(directory, key_filename)
 
     for path in (crt_path, key_path):
         if not os.path.exists(path):
@@ -817,6 +818,7 @@ def ykload():
 def main(argv=None, exit=sys.exit):
     global args
     global conf
+    global directory
     global fs
     global make
     global parser
@@ -825,6 +827,7 @@ def main(argv=None, exit=sys.exit):
         argv = sys.argv
 
     root_path = os.path.abspath(os.path.dirname(__file__))
+    default_directory = os.path.join(root_path, 'files')
 
     root_parser = argparse.ArgumentParser(
         description='A program for managing personal PKI infrastructure.',
@@ -839,8 +842,8 @@ def main(argv=None, exit=sys.exit):
     root_parser.add_argument(
         '-d',
         '--directory',
-        default=os.path.join(root_path, 'files'),
-        help='directory where everything lives (default: %(default)s)',
+        help='directory where everything lives (default: %s)' \
+             % default_directory,
         metavar='DIR',
     )
     root_parser.add_argument(
@@ -876,19 +879,26 @@ def main(argv=None, exit=sys.exit):
         for option in config_parser.options(section):
             conf[section_key][key(option)] = config_parser.get(section, option)
 
+    directory = args.directory
+    if directory is None:
+        if 'directory' in conf.pki:
+            directory = conf.pki.directory
+        else:
+            directory = default_directory
+    directory = os.path.expanduser(os.path.expandvars(directory))
+
     fs = FS(args.dry)
     make = Make(dry=args.dry, source=root_path)
 
     tmp = None
-    wd = args.directory
-    if not os.path.exists(args.directory):
-        print('%s: mkdir' % args.directory)
+    if not os.path.exists(directory):
+        print('%s: mkdir' % directory)
         if args.dry:
-            wd = tmp = tempfile.mkdtemp()
+            directory = tmp = tempfile.mkdtemp()
         else:
-            os.mkdir(args.directory)
+            os.mkdir(directory)
 
-    os.chdir(wd)
+    os.chdir(directory)
     try:
         rv = args._generator.next()
     except StopIteration:

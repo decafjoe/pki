@@ -10,6 +10,7 @@ A program for managing personal PKI infrastructure.
 from __future__ import print_function
 
 import argparse
+import fnmatch
 import os
 import re
 import shutil
@@ -535,6 +536,24 @@ def add_req_arguments():
     )
 
 
+def find_yubikey_certificate():
+    cmd = ('yubico-piv-tool', '--slot=9c', '--action=read-cert')
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    stdout, _ = process.communicate()
+    if not process.returncode:
+        certificate = stdout.strip()
+        filenames = os.listdir(args.directory)
+        filenames = fnmatch.filter(filenames, 'cross-*.pem') \
+                    + fnmatch.filter(filenames, 'intermediate-*.pem')
+        for filename in filenames:
+            path = os.path.join(args.directory, filename)
+            with open(path) as f:
+                if f.read().strip() == certificate:
+                    return filename
+    msg = 'error: no certificate on yubikey, or cert is not in our store'
+    print(msg, file=sys.stderr)
+
+
 @command
 def root():
     """Generate the cross-signed PKI roots."""
@@ -736,6 +755,61 @@ def leaf():
         key_usage=key_usage,
         sign_with=sign_with,
     )
+
+
+@command
+def ykload():
+    """Load a cert/key pair on to a Yubikey."""
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        '-i',
+        '--intermediate',
+        help='id of the intermediate ca certificate/key to load',
+        metavar='ID',
+    )
+    group.add_argument(
+        '-r',
+        '--root',
+        choices=('a', 'b'),
+        help='root ca certificate/key to load (choices: %(choices)s)',
+    )
+
+    yield
+
+    print(find_yubikey_certificate())
+    yield
+
+    if args.intermediate:
+        crt_filename = 'intermediate-%s.crt' % args.intermediate
+        key_filename = 'intermediate-%s.key' % args.intermediate
+    else:
+        crt_filename = 'cross-%s.crt' % args.root
+        key_filename = 'root-%s.key' % args.root
+
+    crt_path = os.path.join(args.directory, crt_filename)
+    key_path = os.path.join(args.directory, key_filename)
+
+    for path in (crt_path, key_path):
+        if not os.path.exists(path):
+            msg = 'error: required file is missing: %s' % path
+            print(msg, file=sys.stderr)
+            yield 1
+
+    subprocess.check_call((
+        'yubico-piv-tool',
+        '--slot=9c',
+        '--action=import-key',
+        '--input=%s' % key_path,
+        '--pin-policy=always',
+        '--touch-policy=always',
+    ))
+    subprocess.check_call((
+        'yubico-piv-tool',
+        '--slot=9c',
+        '--action=import-certificate',
+        '--input=%s' % crt_path,
+    ))
+    subprocess.check_call(('yubico-piv-tool', '--action=status'))
 
 
 def main(argv=None, exit=sys.exit):

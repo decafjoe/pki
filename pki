@@ -180,6 +180,27 @@ class Context(D):
             '-out', self.target,
         )
 
+    def ca(self, *args):
+        if self.yubikey:
+            cmd_ctx = resolve_dict(None, 'pkcs11_so', 'pkcs11_module')
+            cmd_ctx.update(args=' '.join(args))
+            process = subprocess.Popen('openssl', stdin=subprocess.PIPE)
+            process.communicate(
+                'engine -t dynamic '
+                '-pre SO_PATH:%(pkcs11_so)s '
+                '-pre ID:pkcs11 '
+                '-pre LIST_ADD:1 '
+                '-pre LOAD '
+                '-pre MODULE_PATH:%(pkcs11_module)s\n'
+                'ca -batch '
+                '-engine pkcs11 '
+                '-keyform engine '
+                '-keyfile slot_0-id_2 '
+                '%(args)s' % cmd_ctx
+            )
+        else:
+            self.openssl('ca', '-batch', *args)
+
 
 class Make(object):
     def __init__(self, **context):
@@ -418,16 +439,13 @@ def intermediate_conf(ctx):
 @depends('intermediate-%(name)s.conf', 'intermediate-%(name)s.csr')
 @builds_intermediate('\.crt$')
 def intermediate_crt(ctx):
-    ctx.openssl(
-        'ca',
-        '-batch',
+    ctx.ca(
         '-config', 'root.conf',
         '-name', 'cross-%s' % ctx.sign_with,
         '-extensions', 'x509-intermediate',
         '-days', resolve('intermediate', 'days'),
         '-in', 'intermediate-%s.csr' % ctx.name,
         '-out', ctx.target,
-        *ctx.ca_args
     )
 
 
@@ -474,14 +492,11 @@ def leaf_csr(ctx):
 @depends('leaf-%(name)s.csr')
 @builds_leaf('\.crt$')
 def leaf_crt(ctx):
-    ctx.openssl(
-        'ca',
-        '-batch',
+    ctx.ca(
         '-config', 'intermediate-%s.conf' % ctx.sign_with,
         '-days', resolve('leaf', 'days'),
         '-in', 'leaf-%s.csr' % ctx.name,
         '-out', ctx.target,
-        *ctx.ca_args
     )
 
 
@@ -496,6 +511,8 @@ def command(fn):
     commands.append(fn)
     return fn
 
+
+# ----- Certificates ----------------------------------------------------------
 
 def add_req_arguments():
     parser.add_argument(
@@ -537,24 +554,6 @@ def add_req_arguments():
         help='organizational unit name (default: from config)',
         metavar='STR',
     )
-
-
-def find_yubikey_certificate():
-    cmd = ('yubico-piv-tool', '--slot=9c', '--action=read-cert')
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-    stdout, _ = process.communicate()
-    if not process.returncode:
-        certificate = stdout.strip()
-        filenames = os.listdir(directory)
-        filenames = fnmatch.filter(filenames, 'cross-*.pem') \
-                    + fnmatch.filter(filenames, 'intermediate-*.pem')
-        for filename in filenames:
-            path = os.path.join(directory, filename)
-            with open(path) as f:
-                if f.read().strip() == certificate:
-                    return filename
-    msg = 'error: no certificate on yubikey, or cert is not in our store'
-    print(msg, file=sys.stderr)
 
 
 @command
@@ -622,11 +621,18 @@ def intermediate():
         yield 1
 
     if args.yubikey:
-        # TODO(jjoyce): implement this
-        print('error: cannot currently handle yubikeys', file=sys.stderr)
-        yield 1
+        crt_filename = find_yubikey_certificate()
+        if crt_filename is None:
+            yield 1
+        if not crt_filename.startswith('root-'):
+            msg = 'error: intermediate certificates must be signed by the ' \
+                  'root authority (yubikey has "%s")' % crt_filename
+            print(msg, file=sys.stderr)
+            yield 1
+        yubikey = True
+        sign_with = crt_filename.split('-')[1][0]
     else:
-        ca_args = ()
+        yubikey = False
         sign_with = args.sign_with
         crt_path = 'cross-%s.crt' % sign_with
         key_path = 'root-%s.key' % sign_with
@@ -636,7 +642,7 @@ def intermediate():
                 print(msg, file=sys.stderr)
                 yield 1
 
-    make('intermediate-%s.pem' % id, ca_args=ca_args, sign_with=sign_with)
+    make('intermediate-%s.pem' % id, sign_with=sign_with, yubikey=yubikey)
 
 
 @command
@@ -721,11 +727,18 @@ def leaf():
         yield 1
 
     if args.yubikey:
-        # TODO(jjoyce): implement this
-        print('error: cannot currently handle yubikeys', file=sys.stderr)
-        yield 1
+        crt_filename = find_yubikey_certificate()
+        if crt_filename is None:
+            yield 1
+        if not crt_filename.startswith('intermediate-'):
+            msg = 'error: leaf certificates must be signed by intermediate ' \
+                  'certificate authorities (yubikey has "%s")' % crt_filename
+            print(msg, file=sys.stderr)
+            yield 1
+        yubikey = True
+        sign_with = crt_filename.split('-', 1)[1].rsplit('.', 1)[0]
     else:
-        ca_args = ()
+        yubikey = False
         sign_with = args.sign_with
         conf_path = 'intermediate-%s.conf' % args.sign_with
         crt_path = 'intermediate-%s.pem' % args.sign_with
@@ -753,11 +766,39 @@ def leaf():
 
     make(
         'leaf-%s.pem' % id,
-        ca_args=ca_args,
         extended_key_usage=extended_key_usage,
         key_usage=key_usage,
         sign_with=sign_with,
+        yubikey=yubikey,
     )
+
+
+# ----- Yubikey ---------------------------------------------------------------
+
+def yubico_piv_tool(**kwargs):
+    args = ['yubico-piv-tool']
+    for key, value in kwargs.items():
+        args.append('--%s=%s' % (key.replace('_', '-'), value))
+    return tuple(args)
+
+
+def find_yubikey_certificate():
+    cmd = yubico_piv_tool(action='read-cert', slot='9c')
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    stdout, _ = process.communicate()
+    if not process.returncode:
+        certificate = stdout.strip()
+        filenames = os.listdir(directory)
+        filenames = fnmatch.filter(filenames, 'cross-*.pem') \
+                    + fnmatch.filter(filenames, 'intermediate-*.pem')
+        for filename in filenames:
+            path = os.path.join(directory, filename)
+            with open(path) as f:
+                if f.read().strip() == certificate:
+                    return filename
+    msg = 'error: yubikey not inserted, or no certificate on yubikey, or ' \
+          'cert is not one of ours'
+    print(msg, file=sys.stderr)
 
 
 @command
@@ -779,9 +820,6 @@ def ykload():
 
     yield
 
-    print(find_yubikey_certificate())
-    yield
-
     if args.intermediate:
         crt_filename = 'intermediate-%s.crt' % args.intermediate
         key_filename = 'intermediate-%s.key' % args.intermediate
@@ -798,22 +836,32 @@ def ykload():
             print(msg, file=sys.stderr)
             yield 1
 
-    subprocess.check_call((
-        'yubico-piv-tool',
-        '--slot=9c',
-        '--action=import-key',
-        '--input=%s' % key_path,
-        '--pin-policy=always',
-        '--touch-policy=always',
-    ))
-    subprocess.check_call((
-        'yubico-piv-tool',
-        '--slot=9c',
-        '--action=import-certificate',
-        '--input=%s' % crt_path,
-    ))
-    subprocess.check_call(('yubico-piv-tool', '--action=status'))
+    if subprocess.call(yubico_piv_tool(
+        action='import-key',
+        slot='9c',
+        input=key_path,
+        touch_policy='always',
+    )):
+        yield 1
 
+    if subprocess.call(yubico_piv_tool(
+        action='import-certificate',
+        slot='9c',
+        input=crt_path,
+    )):
+        yield 1
+
+    subprocess.call(yubico_piv_tool(action='status'))
+
+
+@command
+def ykpin():
+    """Change the Yubikey signing PIN."""
+    yield
+    yield subprocess.call(yubico_piv_tool(action='change-pin'))
+
+
+# ----- Entry Point -----------------------------------------------------------
 
 def main(argv=None, exit=sys.exit):
     global args
@@ -851,6 +899,17 @@ def main(argv=None, exit=sys.exit):
         action='store_true',
         default=False,
         help='dry run – do not actually run commands, change files, etc',
+    )
+    root_parser.add_argument(
+        '--pkcs11-so',
+        help='specify the path to the pkcs11 openssl engine (default: from '
+             'config)',
+        metavar='PATH',
+    )
+    root_parser.add_argument(
+        '--pkcs11-module',
+        help='specify the path to the pkcs11 plugin (default: from config)',
+        metavar='PATH',
     )
 
     subparsers = root_parser.add_subparsers(

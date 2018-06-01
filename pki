@@ -38,6 +38,20 @@ make = None
 parser = None
 
 
+def resolve(section, key):
+    rv = getattr(args, key, None)
+    if not rv:
+        if section:
+            rv = conf[section].get(key, None)
+        if not rv:
+            rv = conf.pki[key]
+    return rv
+
+
+def resolve_dict(section, *keys):
+    return dict([(key, resolve(section, key)) for key in keys])
+
+
 class D(dict):
     def __getattr__(self, name):
         return self[name]
@@ -117,18 +131,6 @@ class Context(D):
             target = os.path.split(target)[-1]
         print('%s: %s' % (target, ' '.join(args)))
 
-    def resolve(self, section, key):
-        rv = getattr(args, key, None)
-        if not rv:
-            if section:
-                rv = conf[section].get(key, None)
-            if not rv:
-                rv = conf.pki[key]
-        return rv
-
-    def resolve_dict(self, section, *keys):
-        return dict([(key, self.resolve(section, key)) for key in keys])
-
     def render(self, src, dst, **extra_context):
         template_context = D(**self)
         template_context.update(extra_context)
@@ -145,7 +147,7 @@ class Context(D):
             source='%(source)s/csr.conf.in',
             **extra
     ):
-        ctx = self.resolve_dict(
+        ctx = resolve_dict(
             section,
             'country',
             'locality',
@@ -302,13 +304,13 @@ def ca_conf(ctx):
         ctx.render(
             '%(source)s/root.conf.in' % ctx,
             ctx.target,
-            **ctx.resolve_dict(None, 'crl_uri')
+            **resolve_dict(None, 'crl_uri')
         )
 
 
 @builds('root-(?P<which>[ab]).key$')
 def root_key(ctx):
-    ctx.genrsa(ctx.resolve('root', 'key_length'))
+    ctx.genrsa(resolve('root', 'key_length'))
 
 
 @depends('%(source)s/csr.conf.in')
@@ -316,7 +318,7 @@ def root_key(ctx):
 def root_csr_conf(ctx):
     ctx.p('generating csr config file from csr.conf.in')
     if not ctx.dry:
-        org = ctx.resolve('root', 'organization')
+        org = resolve('root', 'organization')
         cn = '%s (%s %s)' % (org, ctx.kind.upper(), ctx.which.upper())
         ctx.render_csr_conf('root', cn, '')
 
@@ -338,7 +340,7 @@ def root_self_crt(ctx):
         '-config', 'root.conf',
         '-name', 'root-%s' % ctx.which,
         '-extensions', 'x509-root',
-        '-days', ctx.resolve('root', 'days'),
+        '-days', resolve('root', 'days'),
         '-in', 'root-%s.csr' % ctx.which,
         '-out', ctx.target,
     )
@@ -353,7 +355,7 @@ def root_cross_crt(ctx):
         '-config', 'root.conf',
         '-name', 'root-%s' % ('b' if ctx.which == 'a' else 'a'),
         '-extensions', 'x509-cross',
-        '-days', ctx.resolve('root', 'days'),
+        '-days', resolve('root', 'days'),
         '-in', 'cross-%s.csr' % ctx.which,
         '-out', ctx.target,
     )
@@ -381,7 +383,7 @@ def builds_intermediate(suffix):
 
 @builds_intermediate('\.key$')
 def intermediate_key(ctx):
-    ctx.genrsa(ctx.resolve('intermediate', 'key_length'))
+    ctx.genrsa(resolve('intermediate', 'key_length'))
 
 
 @depends('%(source)s/csr.conf.in')
@@ -421,7 +423,7 @@ def intermediate_crt(ctx):
         '-config', 'root.conf',
         '-name', 'cross-%s' % ctx.sign_with,
         '-extensions', 'x509-intermediate',
-        '-days', ctx.resolve('intermediate', 'days'),
+        '-days', resolve('intermediate', 'days'),
         '-in', 'intermediate-%s.csr' % ctx.name,
         '-out', ctx.target,
         *ctx.ca_args
@@ -438,7 +440,7 @@ def builds_leaf(suffix):
 
 @builds_leaf('.key$')
 def leaf_key(ctx):
-    ctx.genrsa(ctx.resolve('leaf', 'key_length'))
+    ctx.genrsa(resolve('leaf', 'key_length'))
 
 
 @depends('%(source)s/csr.conf.in')
@@ -475,7 +477,7 @@ def leaf_crt(ctx):
         'ca',
         '-batch',
         '-config', 'intermediate-%s.conf' % ctx.sign_with,
-        '-days', ctx.resolve('leaf', 'days'),
+        '-days', resolve('leaf', 'days'),
         '-in', 'leaf-%s.csr' % ctx.name,
         '-out', ctx.target,
         *ctx.ca_args

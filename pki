@@ -761,14 +761,13 @@ def main(argv=None, exit=sys.exit):
         metavar='FILE',
     )
     root_parser.add_argument(
-        '-o',
-        '--output',
+        '-d',
+        '--directory',
         default=os.path.join(root_path, 'files'),
-        help='directory in which to generate files (default: %(default)s)',
+        help='directory where everything lives (default: %(default)s)',
         metavar='DIR',
     )
     root_parser.add_argument(
-        '-d',
         '--dry',
         action='store_true',
         default=False,
@@ -805,13 +804,13 @@ def main(argv=None, exit=sys.exit):
     make = Make(dry=args.dry, source=root_path)
 
     tmp = None
-    wd = args.output
-    if not os.path.exists(args.output):
-        print('%s: mkdir' % args.output)
+    wd = args.directory
+    if not os.path.exists(args.directory):
+        print('%s: mkdir' % args.directory)
         if args.dry:
             wd = tmp = tempfile.mkdtemp()
         else:
-            os.mkdir(args.output)
+            os.mkdir(args.directory)
 
     os.chdir(wd)
     try:

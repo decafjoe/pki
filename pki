@@ -196,7 +196,7 @@ class Context(D):
                 '-engine pkcs11 '
                 '-keyform engine '
                 '-keyfile slot_0-id_2 '
-                '%(args)s' % cmd_ctx
+                '%(args)s' % cmd_ctx,
             )
         else:
             self.openssl('ca', '-batch', *args)
@@ -219,8 +219,7 @@ class Make(object):
             ctx.p('no build targets matched, assuming this is not built by us')
             return
 
-        target_match_dict = match.groupdict()
-        ctx.update(target_match_dict)
+        ctx.update(match.groupdict())
 
         deps = {}
         for template in deps_remake_templates:
@@ -296,6 +295,7 @@ def empty(ctx):
     if not ctx.dry:
         with open(ctx.target, 'w') as f:
             f.write('')
+
 
 @builds('\.srl$')
 def initial_serial(ctx):
@@ -424,7 +424,6 @@ def intermediate_csr_conf(ctx):
 def intermediate_csr(ctx):
     name = 'intermediate-%s' % ctx.name
     ctx.req(name, name)
-
 
 
 @depends('%(source)s/intermediate.conf.in')
@@ -583,7 +582,7 @@ def intermediate():
     )
     parser.add_argument(
         'name',
-        help='name for the certificate (must match %s)' % pattern,
+        help='name for the certificate',
         nargs=1,
     )
     parser.add_argument(
@@ -652,7 +651,7 @@ def leaf():
 
     parser.add_argument(
         'id',
-        help='identifier of the generated certificate (must match %s)' \
+        help='identifier of the generated certificate (must match %s)'
              % pattern,
         nargs=1,
     )
@@ -875,6 +874,7 @@ def main(argv=None, exit=sys.exit):
         argv = sys.argv
 
     root_path = os.path.abspath(os.path.dirname(__file__))
+    default_config = os.path.join(root_path, 'site.conf')
     default_directory = os.path.join(root_path, 'files')
 
     root_parser = argparse.ArgumentParser(
@@ -883,14 +883,16 @@ def main(argv=None, exit=sys.exit):
     root_parser.add_argument(
         '-c',
         '--config',
-        default=os.path.join(root_path, 'site.conf'),
-        help='path to the site configuration file (default: %(default)s)',
+        action='append',
+        default=[],
+        help='path to the site configuration file(s) (default: %s) (may be '
+             'specified multiple times)' % default_config,
         metavar='FILE',
     )
     root_parser.add_argument(
         '-d',
         '--directory',
-        help='directory where everything lives (default: %s)' \
+        help='directory where everything lives (default: %s)'
              % default_directory,
         metavar='DIR',
     )
@@ -922,13 +924,16 @@ def main(argv=None, exit=sys.exit):
         parser.set_defaults(_generator=generator)
 
     args = root_parser.parse_args(argv[1:])
+    if not args.config:
+        args.config = [default_config]
 
     config_parser = SafeConfigParser()
     with open(os.path.join(root_path, 'defaults.conf')) as f:
         config_parser.readfp(f)
-    if os.path.exists(args.config):
-        with open(args.config) as f:
-            config_parser.readfp(f)
+    for path in args.config:
+        if os.path.exists(path):
+            with open(path) as f:
+                config_parser.readfp(f)
 
     conf = D()
     key = lambda s: s.replace('-', '_')
@@ -972,4 +977,3 @@ def main(argv=None, exit=sys.exit):
 
 if __name__ == '__main__':
     main()
-

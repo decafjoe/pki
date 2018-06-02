@@ -5,7 +5,7 @@ A program for managing personal PKI infrastructure.
 
 :author: Joe Joyce <joe@decafjoe.com>
 :copyright: Copyright (c) Joe Joyce, 2018.
-:license: Proprietary
+:license: BSD
 """
 from __future__ import print_function
 
